@@ -551,7 +551,30 @@ fn collect_table_cells(
         return;
     }
 
-    match display.inside() {
+    // A box that is not table-internal, directly in a row, is wrapped in an anonymous
+    // table cell (CSS 2.2 §17.2.1). Instead of creating a node for that cell, the box
+    // is laid out as the cell itself, without what applies to cells only. That is the
+    // same for a row's only such box; a run of several gets a column each instead of
+    // sharing one cell.
+    let in_row = rows
+        .last()
+        .is_some_and(|row| node.parent == Some(row.node_id));
+    let anonymous_cell = in_row
+        && display.outside() != DisplayOutside::TableCaption
+        && matches!(
+            display.inside(),
+            DisplayInside::Flow
+                | DisplayInside::FlowRoot
+                | DisplayInside::Flex
+                | DisplayInside::Grid
+        );
+    let inside = if anonymous_cell {
+        DisplayInside::TableCell
+    } else {
+        display.inside()
+    };
+
+    match inside {
         DisplayInside::TableRowGroup
         | DisplayInside::TableHeaderGroup
         | DisplayInside::TableFooterGroup
@@ -622,14 +645,15 @@ fn collect_table_cells(
         }
         DisplayInside::TableCell => {
             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+            let is_cell = !anonymous_cell;
             let stylo_style = &node.primary_styles().unwrap();
-            let colspan: u16 = node
-                .attr(local_name!("colspan"))
-                .and_then(|val| val.parse().ok())
-                .unwrap_or(1);
-            let rowspan: u16 = node
-                .attr(local_name!("rowspan"))
-                .and_then(|val| val.parse::<u16>().ok())
+            let span = |name| {
+                node.attr(name)
+                    .filter(|_| is_cell)
+                    .and_then(|val| val.parse::<u16>().ok())
+            };
+            let colspan: u16 = span(local_name!("colspan")).unwrap_or(1);
+            let rowspan: u16 = span(local_name!("rowspan"))
                 .map(|v| v.clamp(1, 65534))
                 .unwrap_or(1);
             let mut style = table_taffy_style(stylo_style, wm);
@@ -637,11 +661,11 @@ fn collect_table_cells(
 
             // In the collapsed borders model the borders are laid out as gutters between
             // the cells (see the table's `gap`) rather than as part of the cells
-            if border_collapse == BorderCollapse::Collapse {
+            if is_cell && border_collapse == BorderCollapse::Collapse {
                 style.border = taffy::Rect::ZERO.map(style_helpers::length);
             }
 
-            if first_cell_border.is_none() {
+            if is_cell && first_cell_border.is_none() {
                 *first_cell_border = Some(stylo_style.clone_border());
             }
 
@@ -704,7 +728,9 @@ fn collect_table_cells(
             }
 
             // The margin properties do not apply to table-internal elements
-            style.margin = taffy::Rect::ZERO.map(style_helpers::length);
+            if is_cell {
+                style.margin = taffy::Rect::ZERO.map(style_helpers::length);
+            }
 
             // Let Taffy auto-place the column. Combined with
             // `grid_auto_flow: RowDense` set on the table root, each cell
