@@ -68,6 +68,14 @@ pub struct TableCell {
     pub row: u16,
     /// Index of the column the cell originates in
     pub column: u16,
+    colspan: u16,
+    /// Whether this is a box that is not table-internal, laid out as its anonymous cell
+    anonymous: bool,
+    /// In the auto table layout algorithm, the larger of the cell's and its column's
+    /// length `width`. That width is a minimum: the column still grows to fit the
+    /// min-content width of its cells, but not to their max-content width. Both of the
+    /// cell's intrinsic widths are therefore its min-content width, and no less than this.
+    min_width: Option<f32>,
     style: taffy::Style<Atom>,
 }
 
@@ -340,6 +348,30 @@ pub(crate) fn build_table_context(
         for (col_idx, percent, extra) in percent_columns {
             if let Some(column) = column_sizes.get_mut(col_idx as usize) {
                 *column = percent_track(percent, extra);
+            }
+        }
+    } else {
+        // In the auto table layout algorithm a column's length width is a minimum, which
+        // the cells of the column carry (see `TableCell::min_width`). A column with no
+        // cell of its own (only spanning cells, or none) keeps it as a fixed width.
+        for (index, column) in column_sizes.iter_mut().enumerate() {
+            if column.max.into_raw().tag() != taffy::CompactLength::LENGTH_TAG {
+                continue;
+            }
+            let width = column.max.into_raw().value();
+            let mut has_cells = false;
+            for cell in cells
+                .iter_mut()
+                .filter(|cell| cell.column as usize == index && cell.colspan == 1)
+            {
+                cell.min_width = Some(cell.min_width.map_or(width, |w| w.max(width)));
+                has_cells = true;
+            }
+            if has_cells {
+                *column = style_helpers::minmax(
+                    style_helpers::min_content(),
+                    style_helpers::max_content(),
+                );
             }
         }
     }
@@ -676,21 +708,27 @@ fn collect_table_cells(
                 style.min_size.width = style_helpers::length(0.0);
             }
 
+            // A length `width`, as the width of the cell's border box
+            let length_width =
+                (style.size.width.tag() == taffy::CompactLength::LENGTH_TAG).then(|| {
+                    let len = style.size.width.value();
+                    let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
+                    let border = style.border.resolve_or_zero(None, resolve_calc_value);
+                    match style.box_sizing {
+                        taffy::BoxSizing::ContentBox => {
+                            len + padding.left + padding.right + border.left + border.right
+                        }
+                        taffy::BoxSizing::BorderBox => len,
+                    }
+                });
+
             // Column widths from `<col>` elements take precedence over cell widths
             let col_needs_width =
                 (col as usize) >= columns.len() || columns[col as usize].max.is_auto();
             if *row == 1 && col_needs_width {
                 let column: TrackSizingFunction = match style.size.width.tag() {
                     taffy::CompactLength::LENGTH_TAG => {
-                        let len = style.size.width.value();
-                        let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
-                        let border = style.border.resolve_or_zero(None, resolve_calc_value);
-                        match style.box_sizing {
-                            taffy::BoxSizing::ContentBox => style_helpers::length(
-                                len + padding.left + padding.right + border.left + border.right,
-                            ),
-                            taffy::BoxSizing::BorderBox => style_helpers::length(len),
-                        }
+                        style_helpers::length(length_width.unwrap_or_default())
                     }
                     taffy::CompactLength::PERCENT_TAG => {
                         if is_fixed {
@@ -756,6 +794,13 @@ fn collect_table_cells(
                 node_id,
                 row: row.saturating_sub(1),
                 column: col,
+                colspan,
+                anonymous: anonymous_cell,
+                min_width: if is_cell && !is_fixed {
+                    length_width
+                } else {
+                    None
+                },
                 style,
             });
 
@@ -844,6 +889,27 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
     ) -> taffy::LayoutOutput {
         let cell = &self.ctx.cells[usize::from(node_id)];
         let node_id = crate::taffy_node_id(cell.node_id);
+        // Measuring the intrinsic width of a cell with a minimum width (see
+        // `TableCell::min_width`): a cell's own `width` would fix the width of its box, so
+        // it is ignored to measure the contents, unless the box is one in an anonymous
+        // cell, whose `width` is its contents'.
+        if let (Some(min_width), None) = (cell.min_width, inputs.known_dimensions.width) {
+            let inputs = taffy::tree::LayoutInput {
+                sizing_mode: if cell.anonymous {
+                    inputs.sizing_mode
+                } else {
+                    taffy::SizingMode::ContentSize
+                },
+                available_space: taffy::Size {
+                    width: taffy::AvailableSpace::MinContent,
+                    ..inputs.available_space
+                },
+                ..inputs
+            };
+            let mut output = self.doc.compute_child_layout(node_id, inputs);
+            output.size.width = output.size.width.max(min_width);
+            return output;
+        }
         self.doc.compute_child_layout(node_id, inputs)
     }
 }
