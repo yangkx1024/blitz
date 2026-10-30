@@ -531,10 +531,7 @@ impl LayoutPassState<'_> {
                     };
                     let context = Arc::clone(context);
 
-                    let mut table_wrapper = TableTreeWrapper {
-                        doc: self,
-                        ctx: context,
-                    };
+                    let mut table_wrapper = TableTreeWrapper::new(self, context, inputs);
                     let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
 
                     // Absolutely positioned children take no part in the table grid. Their

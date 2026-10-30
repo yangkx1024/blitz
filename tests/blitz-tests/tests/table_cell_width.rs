@@ -75,3 +75,17 @@ fn a_column_width_is_a_minimum_for_cells_in_later_rows() {
     assert_eq!(a.width, 50.0);
     assert_eq!(b.x, a.x + 50.0);
 }
+
+#[test]
+fn a_cell_spanning_a_column_with_a_width_widens_the_other_columns() {
+    // From WPT css/css-tables/height-distribution/computing-row-measure-1.html
+    let harness = Harness::from_html(
+        "<table cellspacing=0 cellpadding=0>\
+         <colgroup style='width:auto'><col style='width:10px'><col style='width:auto'></colgroup>\
+         <tr><td id=a style='width:1px'></td><td style='width:auto'></td></tr>\
+         <tr><td colspan=2 style='width:51px'></td></tr>\
+         </table>",
+    );
+
+    assert_eq!(harness.layout_rect("#a").width, 10.0);
+}

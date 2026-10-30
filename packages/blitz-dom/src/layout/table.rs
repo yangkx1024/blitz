@@ -33,6 +33,75 @@ use super::resolve_calc_value;
 pub struct TableTreeWrapper<'a, 'doc> {
     pub(crate) doc: &'a mut LayoutPassState<'doc>,
     pub(crate) ctx: Arc<TableContext>,
+    /// The table's style with its minimum columns widened, if any is
+    style: Option<taffy::Style<Atom>>,
+}
+
+impl<'a, 'doc> TableTreeWrapper<'a, 'doc> {
+    pub(crate) fn new(
+        doc: &'a mut LayoutPassState<'doc>,
+        ctx: Arc<TableContext>,
+        inputs: taffy::tree::LayoutInput,
+    ) -> Self {
+        let mut wrapper = Self {
+            doc,
+            ctx,
+            style: None,
+        };
+        wrapper.widen_columns(inputs);
+        wrapper
+    }
+
+    /// Widen each of the table's minimum columns to the min-content width of the cells
+    /// that originate in it (each at least the column's width, see `TableCell::min_width`)
+    fn widen_columns(&mut self, inputs: taffy::tree::LayoutInput) {
+        let ctx = Arc::clone(&self.ctx);
+        if ctx.minimum_columns.is_empty() {
+            return;
+        }
+        let mut widths = vec![0.0f32; ctx.minimum_columns.len()];
+        for (index, cell) in ctx.cells.iter().enumerate() {
+            if cell.colspan != 1 {
+                continue;
+            }
+            let Ok(column) = ctx
+                .minimum_columns
+                .binary_search_by_key(&cell.column, |&(column, _)| column)
+            else {
+                continue;
+            };
+            let measure_inputs = taffy::tree::LayoutInput {
+                run_mode: taffy::RunMode::ComputeSize,
+                axis: taffy::RequestedAxis::Horizontal,
+                known_dimensions: taffy::Size::NONE,
+                known_dimensions_are_definite: taffy::Size {
+                    width: false,
+                    height: false,
+                },
+                parent_size: taffy::Size::NONE,
+                available_space: taffy::Size {
+                    width: taffy::AvailableSpace::MinContent,
+                    height: taffy::AvailableSpace::MinContent,
+                },
+                ..inputs
+            };
+            let width = self
+                .compute_child_layout(taffy::NodeId::from(index), measure_inputs)
+                .size
+                .width;
+            widths[column] = widths[column].max(width);
+        }
+
+        let mut style: Option<taffy::Style<Atom>> = None;
+        for (&(column, min_width), width) in ctx.minimum_columns.iter().zip(widths) {
+            if width > min_width {
+                let track: TrackSizingFunction = style_helpers::length(width);
+                let style = style.get_or_insert_with(|| ctx.style.clone());
+                style.grid_template_columns[column as usize] = track.into();
+            }
+        }
+        self.style = style;
+    }
 }
 
 // Deliberately not `Clone`: `style` may hold raw pointers into `calc_values`.
@@ -45,6 +114,10 @@ pub struct TableContext {
     pub oof_children: Vec<(NodeId, taffy::Position)>,
     pub rows: Vec<TableRow>,
     pub columns: Vec<TableColumn>,
+    /// In the auto table layout algorithm, the columns whose length width is a minimum,
+    /// with that width (in ascending order): fixed tracks, widened to fit their cells
+    /// before layout
+    minimum_columns: Vec<(u16, f32)>,
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
@@ -265,6 +338,7 @@ pub(crate) fn build_table_context(
     // Percentage widths set on first-row cells: (column index, percentage, padding + border)
     let mut percent_columns: Vec<(u16, f32, f32)> = Vec::new();
     let mut calc_values: Vec<LengthPercentage> = Vec::new();
+    let mut minimum_columns: Vec<(u16, f32)> = Vec::new();
     // Header row groups are laid out before other rows, and footer row groups after
     let row_group_order = |doc: &BaseDocument, child_id: NodeId| -> u8 {
         let display = doc.nodes[child_id]
@@ -351,10 +425,12 @@ pub(crate) fn build_table_context(
             }
         }
     } else {
-        // In the auto table layout algorithm a column's length width is a minimum, which
-        // the cells of the column carry (see `TableCell::min_width`). A column with no
-        // cell of its own (only spanning cells, or none) keeps it as a fixed width.
-        for (index, column) in column_sizes.iter_mut().enumerate() {
+        // In the auto table layout algorithm a column's length width is a minimum: the
+        // column still grows to fit the min-content width of the cells that originate in
+        // it (see `TableCell::min_width`). Its track stays fixed, so that cells spanning
+        // it widen the other columns rather than this one, and is widened before layout
+        // (see `TableTreeWrapper::widen_columns`).
+        for (index, column) in column_sizes.iter().enumerate() {
             if column.max.into_raw().tag() != taffy::CompactLength::LENGTH_TAG {
                 continue;
             }
@@ -368,10 +444,7 @@ pub(crate) fn build_table_context(
                 has_cells = true;
             }
             if has_cells {
-                *column = style_helpers::minmax(
-                    style_helpers::min_content(),
-                    style_helpers::max_content(),
-                );
+                minimum_columns.push((index as u16, width));
             }
         }
     }
@@ -457,6 +530,7 @@ pub(crate) fn build_table_context(
             oof_children,
             rows,
             columns,
+            minimum_columns,
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             border_style: first_cell_border,
@@ -870,7 +944,7 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
     type CustomIdent = Atom;
 
     fn get_core_container_style(&self, _node_id: taffy::NodeId) -> &taffy::Style<Atom> {
-        &self.ctx.style
+        self.style.as_ref().unwrap_or(&self.ctx.style)
     }
 
     fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {
